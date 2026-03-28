@@ -30,13 +30,25 @@ node index.js
 
 ### Run with Docker
 
+A pre-built image is available on [Docker Hub](https://hub.docker.com/r/parabuzzle/vercel-to-coralogix-bridge):
+
 ```bash
-docker build -t vercel-log-drain .
 docker run -p 8080:8080 \
   -e LOG_DRAIN_SECRET=your-log-drain-secret \
   -e CORALOGIX_KEY=your-coralogix-key \
   -e CORALOGIX_INGRESS_URL=https://ingress.us1.coralogix.com/logs/v1/singles \
-  vercel-log-drain
+  parabuzzle/vercel-to-coralogix-bridge:latest
+```
+
+Or build it yourself:
+
+```bash
+docker build -t vercel-to-coralogix-bridge .
+docker run -p 8080:8080 \
+  -e LOG_DRAIN_SECRET=your-log-drain-secret \
+  -e CORALOGIX_KEY=your-coralogix-key \
+  -e CORALOGIX_INGRESS_URL=https://ingress.us1.coralogix.com/logs/v1/singles \
+  vercel-to-coralogix-bridge
 ```
 
 ## Configuring Vercel
