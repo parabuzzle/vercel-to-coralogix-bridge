@@ -24,6 +24,15 @@ const coralogixIngressUrl =
 
 const debug = process.env.DEBUG === "true";
 
+if (!process.env.LOG_DRAIN_SECRET) {
+  console.error("LOG_DRAIN_SECRET is required");
+  process.exit(1);
+}
+if (!coralogixKey) {
+  console.error("CORALOGIX_KEY is required");
+  process.exit(1);
+}
+
 const config = new Coralogix.LoggerConfig({
   applicationName: "Vercel",
   privateKey: coralogixKey,
@@ -43,7 +52,9 @@ async function verifySignature(req) {
     )
     .update(req.rawBody)
     .digest("hex");
-  return signature === req.headers["x-vercel-signature"];
+  const expected = req.headers["x-vercel-signature"] || "";
+  if (signature.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
 }
 
 function transformLevel(level) {
@@ -168,30 +179,36 @@ app.post("/", async (req, res) => {
   const logs = transformLogEntries(req.body);
   if (debug) console.log(`[DEBUG] Forwarding ${logs.length} logs to ${coralogixIngressUrl}`);
 
-  await Promise.all(
-    logs.map(async (log) => {
-      const jsonLog = {
-        text: JSON.stringify(log),
-        severity: transformLevel(log.level),
-        timestamp: log.timestamp,
-        applicationName: process.env.USE_PROJECT_NAME === "true"? log.projectName : process.env.CORALOGIX_APPLICATION_NAME || "Vercel",
-        subsystemName: log.source,
-      };
-      if (debug) console.log(`[DEBUG] Sending log: ${log.source} ${log.statusCode ?? ""} ${log.path ?? ""}`);
-      const response = await fetch(coralogixIngressUrl, {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${coralogixKey}`,
-        },
-        method: "POST",
-        body: JSON.stringify(jsonLog),
-      });
-      if (debug) {
-        const responseBody = await response.text();
-        console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
-      }
-    })
-  );
+  try {
+    await Promise.all(
+      logs.map(async (log) => {
+        const jsonLog = {
+          text: JSON.stringify(log),
+          severity: transformLevel(log.level),
+          timestamp: log.timestamp,
+          applicationName: process.env.USE_PROJECT_NAME === "true"? log.projectName : process.env.CORALOGIX_APPLICATION_NAME || "Vercel",
+          subsystemName: log.source,
+        };
+        if (debug) console.log(`[DEBUG] Sending log: ${log.source} ${log.statusCode ?? ""} ${log.path ?? ""}`);
+        const response = await fetch(coralogixIngressUrl, {
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${coralogixKey}`,
+          },
+          method: "POST",
+          body: JSON.stringify(jsonLog),
+        });
+        if (debug) {
+          const responseBody = await response.text();
+          console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
+        }
+      })
+    );
+  } catch (err) {
+    console.error("Failed to forward logs to Coralogix:", err.message);
+    res.status(502).send("Failed to forward logs");
+    return;
+  }
 
   res.send("ok");
 });
