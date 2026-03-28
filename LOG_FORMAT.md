@@ -90,6 +90,7 @@ These fields are extracted from the Vercel `proxy` object and are only present o
 | `referrer` | string | Referrer of the request |
 | `scheme` | string | Protocol (`https` or `http`) |
 | `responseByteSize` | number | Size of the response in bytes |
+| `vercelId` | string | Unique Vercel request identifier |
 | `vercelCache` | string | Cache status: `MISS`, `HIT`, `STALE`, `BYPASS`, `PRERENDER`, or `REVALIDATED` |
 | `pathType` | string | How the request was served: `func`, `prerender`, `background_func`, `edge`, `middleware`, `streaming_func`, `partial_prerender`, `external`, `static`, `not_found`, `unknown`, `api` |
 | `wafAction` | string | Firewall action taken: `log`, `challenge`, `deny`, `bypass`, `rate_limit` |

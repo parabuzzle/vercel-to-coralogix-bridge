@@ -137,6 +137,7 @@ function transformLogEntry(logEntry) {
     responseByteSize: proxy?.responseByteSize,
     vercelCache: proxy?.vercelCache,
     pathType: proxy?.pathType,
+    vercelId: proxy?.vercelId,
     wafAction: proxy?.wafAction,
     wafRuleId: proxy?.wafRuleId,
   };
