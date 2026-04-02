@@ -30,7 +30,7 @@ const circuitBreaker = {
   },
 
   recordSuccess() {
-    if (this.failures > 0 || this.open) {
+    if (this.open) {
       console.log("Circuit breaker CLOSED — Coralogix reachable again.");
     }
     this.failures = 0;
@@ -259,7 +259,11 @@ app.post("/", async (req, res) => {
     circuitBreaker.recordSuccess();
   } catch (err) {
     circuitBreaker.recordFailure();
-    console.error("Failed to forward logs to Coralogix:", err.message);
+    if (err.name === "TimeoutError") {
+      console.error(`Failed to forward logs to Coralogix: request timed out after ${FETCH_TIMEOUT_MS}ms`);
+    } else {
+      console.error("Failed to forward logs to Coralogix:", err.message, err.cause ? `(${err.cause.code || err.cause.message})` : "");
+    }
     res.status(502).send("Failed to forward logs");
     return;
   }
