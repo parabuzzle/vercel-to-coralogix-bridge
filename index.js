@@ -10,6 +10,45 @@ app.use(
   })
 );
 
+// Circuit breaker state
+const circuitBreaker = {
+  failures: 0,
+  lastFailure: 0,
+  open: false,
+  maxFailures: 5,
+  resetTimeout: 60000,    // 60s before trying again after circuit opens
+  backoffBase: 1000,      // 1s initial backoff
+  backoffMax: 60000,      // 60s max backoff
+
+  recordFailure() {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.maxFailures) {
+      this.open = true;
+      console.error(`Circuit breaker OPEN after ${this.failures} consecutive failures. Will retry in ${this.resetTimeout / 1000}s.`);
+    }
+  },
+
+  recordSuccess() {
+    if (this.failures > 0 || this.open) {
+      console.log("Circuit breaker CLOSED — Coralogix reachable again.");
+    }
+    this.failures = 0;
+    this.open = false;
+  },
+
+  isOpen() {
+    if (!this.open) return false;
+    // Allow a probe request after resetTimeout
+    if (Date.now() - this.lastFailure > this.resetTimeout) {
+      return false; // half-open: let one request through
+    }
+    return true;
+  },
+};
+
+const FETCH_TIMEOUT_MS = 10000; // 10s fetch timeout
+
 const port = process.env.PORT || 8080;
 
 const verifyToken =
@@ -177,35 +216,49 @@ app.post("/", async (req, res) => {
   }
   if (debug) console.log("[DEBUG] Signature verified");
 
+  if (circuitBreaker.isOpen()) {
+    if (debug) console.log("[DEBUG] Circuit breaker open — dropping logs");
+    res.status(503).send("Service temporarily unavailable");
+    return;
+  }
+
   const logs = transformLogEntries(req.body);
   if (debug) console.log(`[DEBUG] Forwarding ${logs.length} logs to ${coralogixIngressUrl}`);
 
+  const appName = process.env.USE_PROJECT_NAME === "true"
+    ? (logs[0]?.projectName || process.env.CORALOGIX_APPLICATION_NAME || "Vercel")
+    : (process.env.CORALOGIX_APPLICATION_NAME || "Vercel");
+
+  const batch = logs.map((log) => ({
+    text: JSON.stringify(log),
+    severity: transformLevel(log.level),
+    timestamp: log.timestamp,
+    applicationName: process.env.USE_PROJECT_NAME === "true" ? log.projectName : appName,
+    subsystemName: log.source,
+  }));
+
   try {
-    await Promise.all(
-      logs.map(async (log) => {
-        const jsonLog = {
-          text: JSON.stringify(log),
-          severity: transformLevel(log.level),
-          timestamp: log.timestamp,
-          applicationName: process.env.USE_PROJECT_NAME === "true"? log.projectName : process.env.CORALOGIX_APPLICATION_NAME || "Vercel",
-          subsystemName: log.source,
-        };
-        if (debug) console.log(`[DEBUG] Sending log: ${log.source} ${log.statusCode ?? ""} ${log.path ?? ""}`);
-        const response = await fetch(coralogixIngressUrl, {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${coralogixKey}`,
-          },
-          method: "POST",
-          body: JSON.stringify(jsonLog),
-        });
-        if (debug) {
-          const responseBody = await response.text();
-          console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
-        }
-      })
-    );
+    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs`);
+    const response = await fetch(coralogixIngressUrl, {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${coralogixKey}`,
+      },
+      method: "POST",
+      body: JSON.stringify(batch),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const responseBody = await response.text();
+      throw new Error(`Coralogix returned ${response.status}: ${responseBody}`);
+    }
+    if (debug) {
+      const responseBody = await response.text();
+      console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
+    }
+    circuitBreaker.recordSuccess();
   } catch (err) {
+    circuitBreaker.recordFailure();
     console.error("Failed to forward logs to Coralogix:", err.message);
     res.status(502).send("Failed to forward logs");
     return;
