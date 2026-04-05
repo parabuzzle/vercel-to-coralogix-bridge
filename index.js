@@ -1,3 +1,7 @@
+const dns = require("dns");
+const https = require("https");
+dns.setDefaultResultOrder("ipv4first");
+
 const express = require("express");
 const crypto = require("crypto");
 const Coralogix = require("coralogix-logger");
@@ -13,19 +17,19 @@ app.use(
 // Circuit breaker state
 const circuitBreaker = {
   failures: 0,
-  lastFailure: 0,
   open: false,
+  nextProbeTime: 0,
   maxFailures: 5,
   resetTimeout: 60000,    // 60s before trying again after circuit opens
-  backoffBase: 1000,      // 1s initial backoff
-  backoffMax: 60000,      // 60s max backoff
 
   recordFailure() {
     this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.maxFailures) {
+    if (!this.open && this.failures >= this.maxFailures) {
       this.open = true;
-      console.error(`Circuit breaker OPEN after ${this.failures} consecutive failures. Will retry in ${this.resetTimeout / 1000}s.`);
+      console.error(`Circuit breaker OPEN — ${this.failures} consecutive failures. Will probe again in ${this.resetTimeout / 1000}s.`);
+    }
+    if (this.open) {
+      this.nextProbeTime = Date.now() + this.resetTimeout;
     }
   },
 
@@ -39,15 +43,65 @@ const circuitBreaker = {
 
   isOpen() {
     if (!this.open) return false;
-    // Allow a probe request after resetTimeout
-    if (Date.now() - this.lastFailure > this.resetTimeout) {
-      return false; // half-open: let one request through
+    if (Date.now() >= this.nextProbeTime) {
+      // Block further probes until this one resolves
+      this.nextProbeTime = Infinity;
+      console.log("Circuit breaker HALF-OPEN — sending probe request.");
+      return false;
     }
     return true;
   },
 };
 
 const FETCH_TIMEOUT_MS = 10000; // 10s fetch timeout
+
+const agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  family: 4,
+});
+
+function postToCoralogix(url, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || 443,
+        path: parsed.pathname,
+        method: "POST",
+        agent,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${coralogixKey}`,
+          "Content-Length": Buffer.byteLength(data),
+        },
+        timeout: FETCH_TIMEOUT_MS,
+      },
+      (res) => {
+        let responseBody = "";
+        res.on("data", (chunk) => (responseBody += chunk));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ status: res.statusCode, body: responseBody });
+          } else {
+            reject(new Error(`Coralogix returned ${res.statusCode}: ${responseBody}`));
+          }
+        });
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`request timed out after ${FETCH_TIMEOUT_MS}ms`));
+    });
+    req.on("error", (err) => {
+      reject(new Error(`fetch failed (${err.code || err.message})`));
+    });
+    req.write(data);
+    req.end();
+  });
+}
 
 const port = process.env.PORT || 8080;
 
@@ -237,33 +291,15 @@ app.post("/", async (req, res) => {
     subsystemName: log.source,
   }));
 
+  const payloadSize = JSON.stringify(batch).length;
   try {
-    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs`);
-    const response = await fetch(coralogixIngressUrl, {
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${coralogixKey}`,
-      },
-      method: "POST",
-      body: JSON.stringify(batch),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok) {
-      const responseBody = await response.text();
-      throw new Error(`Coralogix returned ${response.status}: ${responseBody}`);
-    }
-    if (debug) {
-      const responseBody = await response.text();
-      console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
-    }
+    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs (${(payloadSize / 1024).toFixed(1)}KB)`);
+    const result = await postToCoralogix(coralogixIngressUrl, batch);
+    if (debug) console.log(`[DEBUG] Coralogix response: ${result.status} - ${result.body}`);
     circuitBreaker.recordSuccess();
   } catch (err) {
     circuitBreaker.recordFailure();
-    if (err.name === "TimeoutError") {
-      console.error(`Failed to forward logs to Coralogix: request timed out after ${FETCH_TIMEOUT_MS}ms`);
-    } else {
-      console.error("Failed to forward logs to Coralogix:", err.message, err.cause ? `(${err.cause.code || err.cause.message})` : "");
-    }
+    console.error("Failed to forward logs to Coralogix:", err.message);
     res.status(502).send("Failed to forward logs");
     return;
   }
