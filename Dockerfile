@@ -13,4 +13,4 @@ COPY . /usr/src
 RUN yarn
 
 # start app
-CMD node index.js
+CMD ["node", "--dns-result-order=ipv4first", "index.js"]

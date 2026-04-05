@@ -1,3 +1,7 @@
+const dns = require("dns");
+const https = require("https");
+dns.setDefaultResultOrder("ipv4first");
+
 const express = require("express");
 const crypto = require("crypto");
 const Coralogix = require("coralogix-logger");
@@ -9,6 +13,95 @@ app.use(
     },
   })
 );
+
+// Circuit breaker state
+const circuitBreaker = {
+  failures: 0,
+  open: false,
+  nextProbeTime: 0,
+  maxFailures: 5,
+  resetTimeout: 60000,    // 60s before trying again after circuit opens
+
+  recordFailure() {
+    this.failures++;
+    if (!this.open && this.failures >= this.maxFailures) {
+      this.open = true;
+      console.error(`Circuit breaker OPEN — ${this.failures} consecutive failures. Will probe again in ${this.resetTimeout / 1000}s.`);
+    }
+    if (this.open) {
+      this.nextProbeTime = Date.now() + this.resetTimeout;
+    }
+  },
+
+  recordSuccess() {
+    if (this.open) {
+      console.log("Circuit breaker CLOSED — Coralogix reachable again.");
+    }
+    this.failures = 0;
+    this.open = false;
+  },
+
+  isOpen() {
+    if (!this.open) return false;
+    if (Date.now() >= this.nextProbeTime) {
+      // Block further probes until this one resolves
+      this.nextProbeTime = Infinity;
+      console.log("Circuit breaker HALF-OPEN — sending probe request.");
+      return false;
+    }
+    return true;
+  },
+};
+
+const FETCH_TIMEOUT_MS = 10000; // 10s fetch timeout
+
+const agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  family: 4,
+});
+
+function postToCoralogix(url, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || 443,
+        path: parsed.pathname,
+        method: "POST",
+        agent,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${coralogixKey}`,
+          "Content-Length": Buffer.byteLength(data),
+        },
+        timeout: FETCH_TIMEOUT_MS,
+      },
+      (res) => {
+        let responseBody = "";
+        res.on("data", (chunk) => (responseBody += chunk));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ status: res.statusCode, body: responseBody });
+          } else {
+            reject(new Error(`Coralogix returned ${res.statusCode}: ${responseBody}`));
+          }
+        });
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`request timed out after ${FETCH_TIMEOUT_MS}ms`));
+    });
+    req.on("error", (err) => {
+      reject(new Error(`fetch failed (${err.code || err.message})`));
+    });
+    req.write(data);
+    req.end();
+  });
+}
 
 const port = process.env.PORT || 8080;
 
@@ -177,35 +270,35 @@ app.post("/", async (req, res) => {
   }
   if (debug) console.log("[DEBUG] Signature verified");
 
+  if (circuitBreaker.isOpen()) {
+    if (debug) console.log("[DEBUG] Circuit breaker open — dropping logs");
+    res.status(503).send("Service temporarily unavailable");
+    return;
+  }
+
   const logs = transformLogEntries(req.body);
   if (debug) console.log(`[DEBUG] Forwarding ${logs.length} logs to ${coralogixIngressUrl}`);
 
+  const appName = process.env.USE_PROJECT_NAME === "true"
+    ? (logs[0]?.projectName || process.env.CORALOGIX_APPLICATION_NAME || "Vercel")
+    : (process.env.CORALOGIX_APPLICATION_NAME || "Vercel");
+
+  const batch = logs.map((log) => ({
+    text: JSON.stringify(log),
+    severity: transformLevel(log.level),
+    timestamp: log.timestamp,
+    applicationName: process.env.USE_PROJECT_NAME === "true" ? log.projectName : appName,
+    subsystemName: log.source,
+  }));
+
+  const payloadSize = JSON.stringify(batch).length;
   try {
-    await Promise.all(
-      logs.map(async (log) => {
-        const jsonLog = {
-          text: JSON.stringify(log),
-          severity: transformLevel(log.level),
-          timestamp: log.timestamp,
-          applicationName: process.env.USE_PROJECT_NAME === "true"? log.projectName : process.env.CORALOGIX_APPLICATION_NAME || "Vercel",
-          subsystemName: log.source,
-        };
-        if (debug) console.log(`[DEBUG] Sending log: ${log.source} ${log.statusCode ?? ""} ${log.path ?? ""}`);
-        const response = await fetch(coralogixIngressUrl, {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${coralogixKey}`,
-          },
-          method: "POST",
-          body: JSON.stringify(jsonLog),
-        });
-        if (debug) {
-          const responseBody = await response.text();
-          console.log(`[DEBUG] Coralogix response: ${response.status} ${response.statusText} - ${responseBody}`);
-        }
-      })
-    );
+    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs (${(payloadSize / 1024).toFixed(1)}KB)`);
+    const result = await postToCoralogix(coralogixIngressUrl, batch);
+    if (debug) console.log(`[DEBUG] Coralogix response: ${result.status} - ${result.body}`);
+    circuitBreaker.recordSuccess();
   } catch (err) {
+    circuitBreaker.recordFailure();
     console.error("Failed to forward logs to Coralogix:", err.message);
     res.status(502).send("Failed to forward logs");
     return;
