@@ -8,7 +8,6 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "coralogix-logger": "1.1.30",
     "express": "4.19.2"
   },
   "devDependencies": {
