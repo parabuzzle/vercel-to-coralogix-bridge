@@ -4,7 +4,6 @@ dns.setDefaultResultOrder("ipv4first");
 
 const express = require("express");
 const crypto = require("crypto");
-const Coralogix = require("coralogix-logger");
 const app = express();
 app.use(
   express.json({
@@ -54,6 +53,20 @@ const circuitBreaker = {
 };
 
 const FETCH_TIMEOUT_MS = 10000; // 10s fetch timeout
+const MAX_INFLIGHT = 20; // max concurrent requests to Coralogix
+let inflight = 0;
+
+// Stats for /status endpoint
+const stats = {
+  startedAt: Date.now(),
+  lastLogReceivedAt: 0,
+  lastForwardSuccessAt: 0,
+  lastForwardFailureAt: 0,
+  logsReceived: 0,
+  logsForwarded: 0,
+  logsFailed: 0,
+  logsDropped: 0,
+};
 
 const agent = new https.Agent({
   keepAlive: true,
@@ -125,17 +138,6 @@ if (!coralogixKey) {
   console.error("CORALOGIX_KEY is required");
   process.exit(1);
 }
-
-const config = new Coralogix.LoggerConfig({
-  applicationName: "Vercel",
-  privateKey: coralogixKey,
-  subsystemName: "Logs Drain",
-});
-
-Coralogix.CoralogixLogger.configure(config);
-
-// create a new logger with category
-const logger = new Coralogix.CoralogixLogger("Vercel-Logs-Drain");
 
 async function verifySignature(req) {
   const signature = crypto
@@ -244,6 +246,35 @@ app.get("/", (_, res) => {
   res.send("ok");
 });
 
+app.get("/status", (_, res) => {
+  const now = Date.now();
+  const uptimeSeconds = Math.floor((now - stats.startedAt) / 1000);
+  const secondsSinceLastLog = stats.lastLogReceivedAt ? Math.floor((now - stats.lastLogReceivedAt) / 1000) : null;
+  const secondsSinceLastSuccess = stats.lastForwardSuccessAt ? Math.floor((now - stats.lastForwardSuccessAt) / 1000) : null;
+
+  // Healthy if: circuit breaker is closed AND we've successfully forwarded logs in the last 5 minutes
+  const logsFlowing = secondsSinceLastSuccess !== null && secondsSinceLastSuccess < 300;
+  const healthy = !circuitBreaker.open && logsFlowing;
+
+  const body = {
+    status: healthy ? "healthy" : "degraded",
+    uptime: uptimeSeconds,
+    circuitBreaker: circuitBreaker.open ? "open" : "closed",
+    inflight,
+    logsFlowing,
+    secondsSinceLastLog,
+    secondsSinceLastSuccess,
+    counts: {
+      received: stats.logsReceived,
+      forwarded: stats.logsForwarded,
+      failed: stats.logsFailed,
+      dropped: stats.logsDropped,
+    },
+  };
+
+  res.status(healthy ? 200 : 503).json(body);
+});
+
 app.post("/", async (req, res) => {
   if (debug) {
     console.log(`[DEBUG] POST / - body length: ${req.body?.length ?? 0}, content-type: ${req.headers["content-type"]}`);
@@ -259,19 +290,25 @@ app.post("/", async (req, res) => {
 
   if (!(await verifySignature(req))) {
     if (debug) console.log("[DEBUG] Signature verification failed");
+    console.error("Unauthorized request — signature mismatch");
     res.status(401).send("Unauthorized");
-    logger.addLog(
-      new Coralogix.Log({
-        severity: Coralogix.Severity.error,
-        text: "Unauthorized request",
-      })
-    );
     return;
   }
   if (debug) console.log("[DEBUG] Signature verified");
 
+  stats.lastLogReceivedAt = Date.now();
+  stats.logsReceived += req.body.length;
+
   if (circuitBreaker.isOpen()) {
     if (debug) console.log("[DEBUG] Circuit breaker open — dropping logs");
+    stats.logsDropped += req.body.length;
+    res.status(503).send("Service temporarily unavailable");
+    return;
+  }
+
+  if (inflight >= MAX_INFLIGHT) {
+    if (debug) console.log(`[DEBUG] Too many in-flight requests (${inflight}) — shedding load`);
+    stats.logsDropped += req.body.length;
     res.status(503).send("Service temporarily unavailable");
     return;
   }
@@ -292,16 +329,23 @@ app.post("/", async (req, res) => {
   }));
 
   const payloadSize = JSON.stringify(batch).length;
+  inflight++;
   try {
-    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs (${(payloadSize / 1024).toFixed(1)}KB)`);
+    if (debug) console.log(`[DEBUG] Sending batch of ${batch.length} logs (${(payloadSize / 1024).toFixed(1)}KB) [inflight: ${inflight}]`);
     const result = await postToCoralogix(coralogixIngressUrl, batch);
     if (debug) console.log(`[DEBUG] Coralogix response: ${result.status} - ${result.body}`);
+    stats.logsForwarded += batch.length;
+    stats.lastForwardSuccessAt = Date.now();
     circuitBreaker.recordSuccess();
   } catch (err) {
+    stats.logsFailed += batch.length;
+    stats.lastForwardFailureAt = Date.now();
     circuitBreaker.recordFailure();
     console.error("Failed to forward logs to Coralogix:", err.message);
     res.status(502).send("Failed to forward logs");
     return;
+  } finally {
+    inflight--;
   }
 
   res.send("ok");
@@ -310,10 +354,3 @@ app.post("/", async (req, res) => {
 app.listen(port, () => {
   console.log(`log drain listening on port ${port}`);
 });
-
-const log = new Coralogix.Log({
-  severity: Coralogix.Severity.info,
-  text: "Vercel Log Drain started successfully",
-});
-// send log to coralogix
-logger.addLog(log);
